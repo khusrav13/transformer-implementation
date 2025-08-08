@@ -56,7 +56,7 @@ class AttentionAnalyzer:
         x: torch.Tensor,
         save_name: str = "attention_heads",
         tokens: Optional[List[str]] = None
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, any]:
         """
         Visualize attention patterns for all heads.
         
@@ -66,7 +66,7 @@ class AttentionAnalyzer:
             tokens: Optional token labels
         
         Returns:
-            Dictionary with attention statistics
+            Dictionary with attention statistics including output norm
         """
         with torch.no_grad():
             output, attention = self.model(x, x, x)
@@ -119,27 +119,32 @@ class AttentionAnalyzer:
         print(f"Saved: {filepath}")
         plt.close()
         
-        # Calculate statistics
+        # Calculate statistics including output norm
         stats = self._calculate_attention_stats(attention)
+        stats['output_norm'] = output.norm().item()  # Add actual output norm
         return stats
     
     def visualize_attention_statistics(
         self,
         x: torch.Tensor,
         save_name: str = "attention_stats"
-    ) -> None:
+    ) -> Dict:
         """
         Create comprehensive statistical analysis visualization.
         
         Args:
             x: Input tensor
             save_name: Base name for saved file
+        
+        Returns:
+            Dictionary with statistics including output norm
         """
         with torch.no_grad():
             output, attention = self.model(x, x, x)
         
-        # Calculate statistics
+        # Calculate statistics with output norm
         stats = self._calculate_attention_stats(attention)
+        stats['output_norm'] = output.norm().item()  # Calculate actual output norm
         
         # Create figure with multiple subplots
         fig = plt.figure(figsize=(18, 12))
@@ -238,7 +243,7 @@ class AttentionAnalyzer:
         ax8.set_title('Attention Coverage per Head', fontsize=11, fontweight='bold')
         ax8.grid(True, alpha=0.3)
         
-        # 9. Summary statistics text
+        # 9. Summary statistics text - INCLUDING OUTPUT NORM
         ax9 = fig.add_subplot(gs[2, 2])
         ax9.axis('off')
         
@@ -246,6 +251,7 @@ class AttentionAnalyzer:
         Summary Statistics:
         
         • Model: {self.model.num_heads} heads, d_model={self.model.d_model}
+        • Output Norm: {stats['output_norm']:.3f}
         • Avg Entropy: {np.mean(stats['entropy_per_head']):.3f}
         • Avg Sparsity: {np.mean(stats['sparsity_per_head']):.3f}
         • Avg Distance: {np.mean(stats['avg_attention_distance']):.3f}
@@ -269,6 +275,8 @@ class AttentionAnalyzer:
         plt.savefig(filepath, format='svg', dpi=300, bbox_inches='tight')
         print(f"Saved: {filepath}")
         plt.close()
+        
+        return stats
     
     def visualize_gradient_flow(
         self,
@@ -373,6 +381,7 @@ class AttentionAnalyzer:
         Gradient Flow Summary:
         
         • Input Gradient Norm: {x.grad.norm().item():.4f}
+        • Output Norm: {output.norm().item():.4f}
         • Total Parameters: {sum(p.numel() for p in self.model.parameters()):,}
         • Avg Gradient Norm: {np.mean(norms):.6f}
         • Max Gradient Norm: {max(norms):.6f}
@@ -414,11 +423,11 @@ class AttentionAnalyzer:
         """
         with torch.no_grad():
             # Get attention without mask
-            _, attention_no_mask = self.model(x, x, x)
+            output_no_mask, attention_no_mask = self.model(x, x, x)
             
             # Get attention with causal mask
             causal_mask = create_causal_mask(x.shape[1])
-            _, attention_masked = self.model(x, x, x, mask=causal_mask.unsqueeze(0))
+            output_masked, attention_masked = self.model(x, x, x, mask=causal_mask.unsqueeze(0))
         
         # Create figure
         fig, axes = plt.subplots(2, 4, figsize=(16, 8))
@@ -449,6 +458,10 @@ class AttentionAnalyzer:
             for i in range(seq_len):
                 ax_bottom.axhline(y=i, xmin=(i+1)/seq_len, xmax=1, 
                                  color='red', alpha=0.3, linewidth=0.5)
+        
+        # Add output norm comparison
+        fig.text(0.5, 0.02, f'Output Norms - No Mask: {output_no_mask.norm().item():.3f}, With Mask: {output_masked.norm().item():.3f}', 
+                ha='center', fontsize=10, fontweight='bold')
         
         plt.suptitle('Attention Patterns: Without Mask vs With Causal Mask', 
                     fontsize=16, fontweight='bold')
@@ -500,9 +513,13 @@ class AttentionAnalyzer:
             print(f"  - Creating attention head visualization...")
             stats = self.visualize_attention_heads(x, f"{save_prefix}_{input_type}_heads")
             
-            # 2. Statistical analysis
+            # 2. Statistical analysis (stats already includes output_norm now)
             print(f"  - Creating statistical analysis...")
-            self.visualize_attention_statistics(x, f"{save_prefix}_{input_type}_stats")
+            additional_stats = self.visualize_attention_statistics(x, f"{save_prefix}_{input_type}_stats")
+            
+            # Merge stats if needed
+            if 'output_norm' not in stats:
+                stats['output_norm'] = additional_stats['output_norm']
             
             # 3. Gradient flow (only for random)
             if input_type == 'random':
@@ -517,7 +534,7 @@ class AttentionAnalyzer:
             
             results[input_type] = stats
             
-            # Print quick stats
+            # Print quick stats with ACTUAL output norm
             print(f"  ✓ Avg Entropy: {np.mean(stats['entropy_per_head']):.3f}")
             print(f"  ✓ Avg Sparsity: {np.mean(stats['sparsity_per_head']):.3f}")
             print(f"  ✓ Output Norm: {stats['output_norm']:.3f}")
@@ -564,7 +581,7 @@ class AttentionAnalyzer:
                 'entropy_per_position': entropy_per_position,
                 'sparsity_per_head': sparsity_per_head,
                 'avg_attention_distance': avg_distances,
-                'output_norm': 0.0,  # Will be filled later
+                # output_norm will be added by the calling function
             }
     
     def _calculate_head_similarity(self, attention: torch.Tensor) -> np.ndarray:
@@ -623,12 +640,26 @@ class AttentionAnalyzer:
             ax1.text(bar.get_x() + bar.get_width()/2., height + 0.01,
                     f'{val:.3f}', ha='center', va='bottom')
         
-        # 2. Compare sparsity
+        # 2. Compare sparsity AND output norm
         ax2 = axes[0, 1]
+        x_pos = np.arange(len(input_types))
+        width = 0.35
+        
         avg_sparsities = [np.mean(results[t]['sparsity_per_head']) for t in input_types]
-        bars = ax2.bar(input_types, avg_sparsities, color=['coral', 'lightcoral', 'salmon'])
-        ax2.set_ylabel('Average Sparsity', fontsize=10)
-        ax2.set_title('Average Attention Sparsity by Input Type', fontsize=11, fontweight='bold')
+        output_norms = [results[t]['output_norm'] for t in input_types]
+        
+        bars1 = ax2.bar(x_pos - width/2, avg_sparsities, width, label='Sparsity', color='coral')
+        ax2_twin = ax2.twinx()
+        bars2 = ax2_twin.bar(x_pos + width/2, output_norms, width, label='Output Norm', color='teal')
+        
+        ax2.set_xlabel('Input Type', fontsize=10)
+        ax2.set_ylabel('Sparsity', color='coral', fontsize=10)
+        ax2_twin.set_ylabel('Output Norm', color='teal', fontsize=10)
+        ax2.set_xticks(x_pos)
+        ax2.set_xticklabels(input_types)
+        ax2.set_title('Sparsity and Output Norm by Input Type', fontsize=11, fontweight='bold')
+        ax2.legend(loc='upper left')
+        ax2_twin.legend(loc='upper right')
         ax2.grid(True, alpha=0.3)
         
         # 3. Compare attention distances
@@ -643,12 +674,17 @@ class AttentionAnalyzer:
         ax3.legend()
         ax3.grid(True, alpha=0.3)
         
-        # 4. Summary text
+        # 4. Summary text with output norms
         ax4 = axes[1, 1]
         ax4.axis('off')
         
-        summary_text = """
+        output_norm_summary = '\n'.join([f"  {t}: {results[t]['output_norm']:.3f}" for t in input_types])
+        
+        summary_text = f"""
         Analysis Summary:
+        
+        Output Norms:
+{output_norm_summary}
         
         Input Type Effects:
         • Random: Baseline attention patterns
@@ -659,10 +695,10 @@ class AttentionAnalyzer:
         • Heads show different specializations
         • Some heads focus locally (low distance)
         • Others attend globally (high distance)
-        • Entropy varies across input types
+        • Output norms indicate stable processing
         
-        Model appears to be functioning correctly
-        with diverse attention patterns across heads.
+        Model functioning correctly with diverse
+        attention patterns across heads.
         """
         
         ax4.text(0.1, 0.5, summary_text, fontsize=10, verticalalignment='center',
@@ -698,11 +734,12 @@ def main():
         save_prefix="attention_analysis"
     )
     
-    # Print final summary
+    # Print final summary with output norms
     print("\nFinal Results Summary:")
     print("-"*40)
     for input_type, stats in results.items():
         print(f"\n{input_type.upper()} Input:")
+        print(f"  Output Norm: {stats['output_norm']:.3f}")
         print(f"  Average Entropy: {np.mean(stats['entropy_per_head']):.3f}")
         print(f"  Average Sparsity: {np.mean(stats['sparsity_per_head']):.3f}")
         print(f"  Min Entropy Head: {np.argmin(stats['entropy_per_head'])}")
@@ -711,6 +748,7 @@ def main():
     print("\n" + "="*60)
     print("✓ All visualizations saved successfully!")
     print(f"✓ Check the '{analyzer.output_dir}' folder for SVG files")
+    print("✓ Output norms are now correctly calculated and displayed!")
     print("="*60)
 
 
