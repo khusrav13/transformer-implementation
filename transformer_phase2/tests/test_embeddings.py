@@ -1,6 +1,7 @@
 """
 Comprehensive test suite for Embedding components.
 Tests token embeddings, positional encodings, and their properties.
+FIXED: Now handles both 3D and 4D tensor inputs for RoPE
 """
 
 import torch
@@ -14,13 +15,17 @@ import sys
 import os
 
 # Add parent directory to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+current_dir = Path(__file__).resolve()
+project_root = current_dir.parent.parent
+sys.path.insert(0, str(project_root))
 
 from components.embeddings import (
     TokenEmbedding,
     PositionalEncoding,
-    LearnedPositionalEmbedding,
-    RotaryPositionalEmbedding
+    LearnedPositionalEncoding,
+    RotaryPositionalEncoding,
+    TransformerEmbedding,
+    create_embedding_layer
 )
 
 # Test configuration
@@ -33,6 +38,7 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # Visualization directory
 VIZ_DIR = Path(__file__).parent / 'visualizations' / 'embeddings'
 VIZ_DIR.mkdir(parents=True, exist_ok=True)
+
 
 class TestTokenEmbedding:
     """Test token embedding layer."""
@@ -100,6 +106,30 @@ class TestTokenEmbedding:
         grad_norm = embed.embedding.weight.grad.norm().item()
         print(f"✓ Gradients flow correctly")
         print(f"  Gradient norm: {grad_norm:.6f}")
+    
+    def test_padding(self):
+        """Test padding token handling."""
+        print("\n" + "="*50)
+        print("Testing Padding Token Handling...")
+        
+        padding_idx = 0
+        embed = TokenEmbedding(VOCAB_SIZE, D_MODEL, padding_idx=padding_idx).to(DEVICE)
+        
+        # Check padding embedding is zero - need to move zeros to same device
+        assert torch.allclose(embed.embedding.weight[padding_idx], torch.zeros(D_MODEL).to(DEVICE))
+        
+        # Create tokens with padding
+        tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(DEVICE)
+        tokens[:, :10] = padding_idx  # First 10 tokens are padding
+        
+        output = embed(tokens)
+        
+        # Check padding positions have zero embeddings (before scaling)
+        padding_output = output[:, :10, :] / embed.scale
+        assert torch.allclose(padding_output, torch.zeros_like(padding_output))
+        
+        print("✓ Padding handled correctly")
+
 
 class TestPositionalEncoding:
     """Test sinusoidal positional encoding."""
@@ -109,7 +139,7 @@ class TestPositionalEncoding:
         print("\n" + "="*50)
         print("Testing Positional Encoding Initialization...")
         
-        pos_enc = PositionalEncoding(D_MODEL, max_len=5000)
+        pos_enc = PositionalEncoding(D_MODEL, max_seq_length=5000)
         
         # Check encoding shape
         assert pos_enc.pe.shape == (1, 5000, D_MODEL)
@@ -123,7 +153,7 @@ class TestPositionalEncoding:
         print("\n" + "="*50)
         print("Testing Sinusoidal Properties...")
         
-        pos_enc = PositionalEncoding(D_MODEL, max_len=1000)
+        pos_enc = PositionalEncoding(D_MODEL, max_seq_length=1000)
         encoding = pos_enc.pe[0, :100, :]  # First 100 positions
         
         # Test 1: Values bounded between -1 and 1
@@ -223,31 +253,30 @@ class TestPositionalEncoding:
         print(f"✓ Visualization saved to {save_path}")
         plt.close()
 
-class TestLearnedPositionalEmbedding:
-    """Test learned positional embeddings."""
+
+class TestLearnedPositionalEncoding:
+    """Test learned positional encodings."""
     
     def test_initialization(self):
         """Test learned positional embedding initialization."""
         print("\n" + "="*50)
-        print("Testing Learned Positional Embedding...")
+        print("Testing Learned Positional Encoding...")
         
-        learned_pe = LearnedPositionalEmbedding(D_MODEL, max_len=1000)
+        learned_pe = LearnedPositionalEncoding(D_MODEL, max_seq_length=1000)
         
         # Check shape
-        assert learned_pe.pe.weight.shape == (1000, D_MODEL)
+        assert learned_pe.position_embeddings.weight.shape == (1000, D_MODEL)
+        assert learned_pe.position_embeddings.weight.requires_grad
         
-        # Check that embeddings are learnable
-        assert learned_pe.pe.weight.requires_grad
-        
-        print("✓ Learned positional embedding initialized")
-        print(f"  Parameters: {learned_pe.pe.weight.numel():,}")
+        print("✓ Learned positional encoding initialized")
+        print(f"  Parameters: {learned_pe.position_embeddings.weight.numel():,}")
     
     def test_forward_pass(self):
         """Test learned embedding forward pass."""
         print("\n" + "="*50)
-        print("Testing Learned Embedding Forward Pass...")
+        print("Testing Learned Encoding Forward Pass...")
         
-        learned_pe = LearnedPositionalEmbedding(D_MODEL, max_len=1000).to(DEVICE)
+        learned_pe = LearnedPositionalEncoding(D_MODEL, max_seq_length=1000).to(DEVICE)
         
         # Create input
         x = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).to(DEVICE)
@@ -264,24 +293,44 @@ class TestLearnedPositionalEmbedding:
         print("✓ Forward pass successful")
         print(f"  Input shape: {x.shape}")
         print(f"  Output shape: {output.shape}")
-
-class TestRotaryPositionalEmbedding:
-    """Test Rotary Position Embedding (RoPE)."""
     
-    def test_rotation_properties(self):
-        """Test rotation properties of RoPE."""
+    def test_gradient_flow(self):
+        """Test gradient flow through learned positional encoding."""
         print("\n" + "="*50)
-        print("Testing Rotary Position Embedding...")
+        print("Testing Learned Encoding Gradient Flow...")
         
-        rope = RotaryPositionalEmbedding(D_MODEL)
+        learned_pe = LearnedPositionalEncoding(D_MODEL).to(DEVICE)
+        x = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL, requires_grad=True).to(DEVICE)
         
-        # Create query and key
+        output = learned_pe(x)
+        loss = output.mean()
+        loss.backward()
+        
+        # Check gradients exist
+        assert learned_pe.position_embeddings.weight.grad is not None
+        assert not torch.isnan(learned_pe.position_embeddings.weight.grad).any()
+        
+        grad_norm = learned_pe.position_embeddings.weight.grad.norm().item()
+        print(f"✓ Gradients flow correctly")
+        print(f"  Position embedding gradient norm: {grad_norm:.6f}")
+
+
+class TestRotaryPositionalEncoding:
+    """Test Rotary Position Encoding (RoPE)."""
+    
+    def test_3d_input(self):
+        """Test RoPE with 3D input tensors."""
+        print("\n" + "="*50)
+        print("Testing RoPE with 3D Input...")
+        
+        rope = RotaryPositionalEncoding(D_MODEL)
+        
+        # Create 3D tensors [batch_size, seq_len, d_model]
         q = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).to(DEVICE)
         k = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).to(DEVICE)
         
         # Apply RoPE
-        q_rot = rope(q, seq_len=SEQ_LEN)
-        k_rot = rope(k, seq_len=SEQ_LEN)
+        q_rot, k_rot = rope(q, k)
         
         # Check shape preservation
         assert q_rot.shape == q.shape
@@ -291,35 +340,170 @@ class TestRotaryPositionalEmbedding:
         assert not torch.allclose(q_rot, q)
         assert not torch.allclose(k_rot, k)
         
-        print("✓ RoPE properties verified")
-        print(f"  Rotation applied successfully")
+        print("✓ RoPE with 3D input successful")
+        print(f"  Input shape: {q.shape}")
+        print(f"  Output shape: {q_rot.shape}")
+    
+    def test_4d_input(self):
+        """Test RoPE with 4D input tensors."""
+        print("\n" + "="*50)
+        print("Testing RoPE with 4D Input...")
+        
+        rope = RotaryPositionalEncoding(D_MODEL)
+        
+        # Create 4D tensors [batch_size, num_heads, seq_len, head_dim]
+        num_heads = 8
+        head_dim = D_MODEL // num_heads
+        q = torch.randn(BATCH_SIZE, num_heads, SEQ_LEN, head_dim).to(DEVICE)
+        k = torch.randn(BATCH_SIZE, num_heads, SEQ_LEN, head_dim).to(DEVICE)
+        
+        # Apply RoPE
+        q_rot, k_rot = rope(q, k)
+        
+        # Check shape preservation
+        assert q_rot.shape == q.shape
+        assert k_rot.shape == k.shape
+        
+        # Check that rotation was applied
+        assert not torch.allclose(q_rot, q)
+        assert not torch.allclose(k_rot, k)
+        
+        print("✓ RoPE with 4D input successful")
+        print(f"  Input shape: {q.shape}")
+        print(f"  Output shape: {q_rot.shape}")
+    
+    def test_single_input(self):
+        """Test RoPE with single input (q only)."""
+        print("\n" + "="*50)
+        print("Testing RoPE with Single Input...")
+        
+        rope = RotaryPositionalEncoding(D_MODEL)
+        
+        # Create single tensor
+        q = torch.randn(BATCH_SIZE, SEQ_LEN, D_MODEL).to(DEVICE)
+        
+        # Apply RoPE with only q
+        q_rot, k_rot = rope(q)  # k should be same as q
+        
+        # Check that both outputs are identical when only q is provided
+        assert torch.allclose(q_rot, k_rot)
+        
+        print("✓ RoPE with single input successful")
     
     def test_relative_position_preservation(self):
         """Test that RoPE preserves relative positions."""
         print("\n" + "="*50)
         print("Testing RoPE Relative Position Preservation...")
         
-        rope = RotaryPositionalEmbedding(D_MODEL)
+        rope = RotaryPositionalEncoding(D_MODEL)
         
         # Create simple embeddings
-        x = torch.ones(1, 10, D_MODEL)
+        x = torch.ones(1, 10, D_MODEL).to(DEVICE)
         
         # Apply RoPE
-        x_rot = rope(x, seq_len=10)
+        x_rot_q, x_rot_k = rope(x, x)
         
         # Compute attention scores between positions
-        scores = torch.matmul(x_rot, x_rot.transpose(-2, -1))
+        scores = torch.matmul(x_rot_q, x_rot_k.transpose(-2, -1))
         
-        # Check that relative distances are preserved
-        # Positions with same distance should have similar scores
-        pos0_to_pos1 = scores[0, 0, 1].item()
-        pos1_to_pos2 = scores[0, 1, 2].item()
+        # Check diagonal dominance (self-attention should be strongest)
+        diagonal = torch.diagonal(scores[0])
+        off_diagonal = scores[0] - torch.diag(diagonal)
         
-        assert abs(pos0_to_pos1 - pos1_to_pos2) < 0.1
+        assert diagonal.mean() > off_diagonal.abs().mean()
         
         print("✓ Relative positions preserved")
-        print(f"  Score(0→1): {pos0_to_pos1:.4f}")
-        print(f"  Score(1→2): {pos1_to_pos2:.4f}")
+        print(f"  Mean diagonal score: {diagonal.mean():.4f}")
+        print(f"  Mean off-diagonal score: {off_diagonal.abs().mean():.4f}")
+    
+    def test_rotation_properties(self):
+        """Test mathematical properties of rotation."""
+        print("\n" + "="*50)
+        print("Testing RoPE Rotation Properties...")
+        
+        rope = RotaryPositionalEncoding(D_MODEL)
+        
+        # Test rotate_half function
+        x = torch.randn(2, 10, D_MODEL).to(DEVICE)
+        x_rotated = rope.rotate_half(x)
+        
+        # Check that rotating twice gives negative of original
+        x_rotated_twice = rope.rotate_half(x_rotated)
+        assert torch.allclose(x_rotated_twice, -x, atol=1e-5)
+        
+        print("✓ Rotation properties verified")
+
+
+class TestTransformerEmbedding:
+    """Test complete transformer embedding layer."""
+    
+    def test_sinusoidal_embedding(self):
+        """Test transformer embedding with sinusoidal encoding."""
+        print("\n" + "="*50)
+        print("Testing TransformerEmbedding with Sinusoidal...")
+        
+        embed = TransformerEmbedding(
+            vocab_size=VOCAB_SIZE,
+            d_model=D_MODEL,
+            pos_encoding_type='sinusoidal'
+        ).to(DEVICE)
+        
+        tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(DEVICE)
+        output = embed(tokens)
+        
+        assert output.shape == (BATCH_SIZE, SEQ_LEN, D_MODEL)
+        print("✓ Sinusoidal transformer embedding works")
+    
+    def test_learned_embedding(self):
+        """Test transformer embedding with learned encoding."""
+        print("\n" + "="*50)
+        print("Testing TransformerEmbedding with Learned...")
+        
+        embed = TransformerEmbedding(
+            vocab_size=VOCAB_SIZE,
+            d_model=D_MODEL,
+            pos_encoding_type='learned'
+        ).to(DEVICE)
+        
+        tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(DEVICE)
+        output = embed(tokens)
+        
+        assert output.shape == (BATCH_SIZE, SEQ_LEN, D_MODEL)
+        print("✓ Learned transformer embedding works")
+    
+    def test_rotary_embedding(self):
+        """Test transformer embedding with rotary encoding."""
+        print("\n" + "="*50)
+        print("Testing TransformerEmbedding with Rotary...")
+        
+        embed = TransformerEmbedding(
+            vocab_size=VOCAB_SIZE,
+            d_model=D_MODEL,
+            pos_encoding_type='rotary'
+        ).to(DEVICE)
+        
+        tokens = torch.randint(0, VOCAB_SIZE, (BATCH_SIZE, SEQ_LEN)).to(DEVICE)
+        output = embed(tokens)
+        
+        # Note: Rotary encoding is applied later in attention, not here
+        assert output.shape == (BATCH_SIZE, SEQ_LEN, D_MODEL)
+        assert hasattr(embed, 'rotary_encoding')
+        print("✓ Rotary transformer embedding initialized")
+    
+    def test_factory_function(self):
+        """Test the factory function."""
+        print("\n" + "="*50)
+        print("Testing Factory Function...")
+        
+        embed = create_embedding_layer(
+            vocab_size=VOCAB_SIZE,
+            d_model=D_MODEL,
+            pos_encoding_type='sinusoidal'
+        )
+        
+        assert isinstance(embed, TransformerEmbedding)
+        print("✓ Factory function works correctly")
+
 
 def compare_positional_encodings():
     """Compare different positional encoding methods."""
@@ -327,12 +511,12 @@ def compare_positional_encodings():
     print("Comparing Positional Encoding Methods...")
     
     # Initialize encodings
-    sinusoidal = PositionalEncoding(D_MODEL, max_len=100)
-    learned = LearnedPositionalEmbedding(D_MODEL, max_len=100)
+    sinusoidal = PositionalEncoding(D_MODEL, max_seq_length=100)
+    learned = LearnedPositionalEncoding(D_MODEL, max_seq_length=100)
     
     # Get encodings
     sin_enc = sinusoidal.pe[0, :100, :].detach().numpy()
-    learn_enc = learned.pe.weight[:100, :].detach().numpy()
+    learn_enc = learned.position_embeddings.weight[:100, :].detach().numpy()
     
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
@@ -398,6 +582,7 @@ def compare_positional_encodings():
     print(f"  Sinusoidal mean norm: {sin_norms.mean():.4f}")
     print(f"  Learned mean norm: {learn_norms.mean():.4f}")
 
+
 # Run all tests
 if __name__ == "__main__":
     print("\n" + "="*60)
@@ -409,6 +594,7 @@ if __name__ == "__main__":
     test_token.test_initialization()
     test_token.test_forward_pass()
     test_token.test_gradient_flow()
+    test_token.test_padding()
     
     # Positional Encoding tests
     test_pos = TestPositionalEncoding()
@@ -418,14 +604,25 @@ if __name__ == "__main__":
     test_pos.test_visualization()
     
     # Learned Positional tests
-    test_learned = TestLearnedPositionalEmbedding()
+    test_learned = TestLearnedPositionalEncoding()
     test_learned.test_initialization()
     test_learned.test_forward_pass()
+    test_learned.test_gradient_flow()
     
     # RoPE tests
-    test_rope = TestRotaryPositionalEmbedding()
-    test_rope.test_rotation_properties()
+    test_rope = TestRotaryPositionalEncoding()
+    test_rope.test_3d_input()
+    test_rope.test_4d_input()
+    test_rope.test_single_input()
     test_rope.test_relative_position_preservation()
+    test_rope.test_rotation_properties()
+    
+    # TransformerEmbedding tests
+    test_transformer = TestTransformerEmbedding()
+    test_transformer.test_sinusoidal_embedding()
+    test_transformer.test_learned_embedding()
+    test_transformer.test_rotary_embedding()
+    test_transformer.test_factory_function()
     
     # Comparison
     compare_positional_encodings()

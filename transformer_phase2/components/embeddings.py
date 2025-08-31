@@ -1,6 +1,7 @@
 """
 Embedding Layers for Transformer
 This module implements token embeddings and positional encoding.
+FIXED: RotaryPositionalEncoding now handles dimensions correctly
 """
 
 import torch
@@ -204,8 +205,12 @@ class RotaryPositionalEncoding(nn.Module):
     A more recent positional encoding method that applies rotation matrices
     to encode position information. Used in models like LLaMA.
     
+    This implementation is flexible and handles multiple input formats:
+    - 3D tensors: [batch_size, seq_len, d_model]
+    - 4D tensors: [batch_size, num_heads, seq_len, head_dim]
+    
     Args:
-        d_model: Dimension of the model
+        d_model: Dimension of the model (or head_dim * num_heads)
         max_seq_length: Maximum sequence length
         base: Base for the exponential
     """
@@ -222,51 +227,87 @@ class RotaryPositionalEncoding(nn.Module):
         self.max_seq_length = max_seq_length
         self.base = base
         
-        # Precompute the frequency bands
-        inv_freq = 1.0 / (base ** (torch.arange(0, d_model, 2).float() / d_model))
-        self.register_buffer('inv_freq', inv_freq)
+        # We'll compute the frequencies on the fly based on input dimensions
         
-        # Precompute rotary embeddings for max_seq_length
-        self._precompute_rotary_embeddings()
+    def _compute_inv_freq(self, dim: int, device: torch.device):
+        """Compute inverse frequencies for the given dimension"""
+        return 1.0 / (self.base ** (torch.arange(0, dim, 2, device=device).float() / dim))
     
-    def _precompute_rotary_embeddings(self):
-        """Precompute rotary embeddings for all positions"""
-        # Create position indices
-        t = torch.arange(self.max_seq_length).type_as(self.inv_freq)
+    def _compute_position_embeddings(self, seq_len: int, dim: int, device: torch.device):
+        """Compute sin/cos position embeddings"""
+        inv_freq = self._compute_inv_freq(dim, device)
+        t = torch.arange(seq_len, device=device).float()
         
-        # Compute frequencies for each position
-        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        # Create frequencies matrix
+        freqs = torch.einsum('i,j->ij', t, inv_freq)
         
-        # Create rotation matrices (cos and sin components)
+        # Create embeddings - concatenate to match dimension
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer('cos_cached', emb.cos())
-        self.register_buffer('sin_cached', emb.sin())
+        
+        return emb.cos(), emb.sin()
     
     def rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         """Rotate half the hidden dims of the input"""
         x1, x2 = x.chunk(2, dim=-1)
         return torch.cat((-x2, x1), dim=-1)
     
-    def forward(self, q: torch.Tensor, k: torch.Tensor) -> tuple:
+    def apply_rotary_pos_emb(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+        """Apply rotary position embeddings to input tensor"""
+        return (x * cos) + (self.rotate_half(x) * sin)
+    
+    def forward(self, q: torch.Tensor, k: torch.Tensor = None):
         """
         Apply rotary positional encoding to query and key tensors
         
         Args:
-            q: Query tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            k: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            q: Query tensor - either:
+               - [batch_size, seq_len, d_model] for 3D input
+               - [batch_size, num_heads, seq_len, head_dim] for 4D input
+            k: Key tensor (optional, if None will use same as q)
+               Same shape requirements as q
         
         Returns:
             Tuple of (q_rotated, k_rotated) with positional information
+            If only q provided and k is None, returns (q_rotated, q_rotated)
         """
-        batch_size, num_heads, seq_len, head_dim = q.shape
+        # Handle the case where k is not provided
+        if k is None:
+            k = q
         
-        # Get cached cos and sin values
-        cos = self.cos_cached[:seq_len, :].unsqueeze(0).unsqueeze(0)
-        sin = self.sin_cached[:seq_len, :].unsqueeze(0).unsqueeze(0)
+        # Get shape information
+        orig_shape = q.shape
+        device = q.device
         
-        # Apply rotation
-        q_rotated = (q * cos) + (self.rotate_half(q) * sin)
-        k_rotated = (k * cos) + (self.rotate_half(k) * sin)
+        # Handle both 3D and 4D inputs
+        if len(orig_shape) == 3:
+            # 3D input: [batch_size, seq_len, d_model]
+            batch_size, seq_len, d_model = orig_shape
+            # Treat as single head for RoPE
+            q = q.unsqueeze(1)  # [batch_size, 1, seq_len, d_model]
+            k = k.unsqueeze(1) if k is not None else q
+            num_heads = 1
+            head_dim = d_model
+        else:
+            # 4D input: [batch_size, num_heads, seq_len, head_dim]
+            batch_size, num_heads, seq_len, head_dim = orig_shape
+        
+        # Compute position embeddings based on actual head dimension
+        cos, sin = self._compute_position_embeddings(seq_len, head_dim, device)
+        
+        # Reshape for broadcasting
+        # cos/sin shape: [seq_len, head_dim]
+        # Need shape: [1, 1, seq_len, head_dim] for broadcasting
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        
+        # Apply rotary embeddings
+        q_rotated = self.apply_rotary_pos_emb(q, cos, sin)
+        k_rotated = self.apply_rotary_pos_emb(k, cos, sin)
+        
+        # Restore original shape if input was 3D
+        if len(orig_shape) == 3:
+            q_rotated = q_rotated.squeeze(1)
+            k_rotated = k_rotated.squeeze(1)
         
         return q_rotated, k_rotated
 
